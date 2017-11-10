@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# verzweiflung - a TCP hack for lossy environments
+# Written and placed into the public domain by
+# Elias Oenal <verzweiflung@eliasoenal.com>
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL ELIAS OENAL BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+set -e
+APPNAME="$(basename $0)"
+VERSION="v0.1"
+LEVEL=3
+OS_TYPE=$(uname)
+SRC_PORT_OPT=""
+DST_PORT_OPT=""
+
+verzweiflung_help()
+{
+  echo "$APPNAME $VERSION"
+  echo "Written and placed into the public domain by"
+  echo "Elias Oenal <verzweiflung@eliasoenal.com>"
+  echo ""
+  echo "WARNING: verzweiflung violates internet standards"
+  echo "         don't use it in production environments"
+  echo ""
+  echo "verzweiflung is a hack to fortify TCP connections against"
+  echo "packet loss under unreliable network conditions. Enabling"
+  echo "verzweiflung does not solve the underlying network issues,"
+  echo "but instead compounds the overall load, while shifting"
+  echo "the symptoms over to other users. It is a desperate tool"
+  echo "for desperate times - use with caution."
+  echo ""
+  echo "usage: $APPNAME [-options]"
+  echo " -c             cease operation - disable verzweiflung"
+  echo " -d port        destination port"
+  echo " -f             force apply - no questions asked"
+  echo " -g gateway     gateway (e.g. 192.168.0.1) - overrides autodetection"
+  echo " -h             print this help"
+  echo " -i interface   network interface (e.g. eth0) - overrides autodetection"
+  echo " -l level       level of despair - the number of retransmissions"
+  echo "                higher values increase overhead and redundancy,"
+  echo "                valid values are 2 to 4"
+  echo " -m             print traffic statistics"
+  echo " -s port        source port"
+  echo ""
+}
+
+verzweiflung_stats()
+{
+  set -e
+  verzweiflung_is_active && true
+  if [ $? -eq 0 ]; then
+    echo "$APPNAME: printing traffic control statistics"
+    tc -s qdisc ls dev "$INTERFACE" | tail -n12
+  else
+    echo "$APPNAME: hack is inactive!"
+  fi
+}
+
+verzweiflung_flush()
+{
+  set +e
+  echo -n "$APPNAME: flushing iptables..."
+  iptables -t mangle -F > /dev/null 2> /dev/null
+  if [ $? -eq 0 ]; then
+    echo " success"
+  else
+    echo " failure"
+  fi
+  echo -n "$APPNAME: flushing traffic control..."
+  tc qdisc del dev "$INTERFACE" root > /dev/null 2> /dev/null
+  if [ $? -eq 0 ]; then
+    echo " success"
+  else
+    echo " failure"
+  fi
+  set -e
+}
+
+verzweiflung_is_active()
+{
+  set +e
+  tc -s qdisc ls | grep netem > /dev/null
+  TC_RET=$?
+  iptables -n -t mangle -L | grep "MARK set 0x1" > /dev/null
+  IPT_RET=$?
+  set -e
+  if [ "$TC_RET" -eq 0 ] || [ "$IPT_RET" -eq 0 ]; then
+    return 0
+  fi
+  return 1
+}
+
+verzweiflung_cease()
+{
+  set -e
+  verzweiflung_is_active && true
+  if [ $? -eq 0 ]; then
+    if [ ! "$FORCE" ]; then
+      echo "$APPNAME: hack is currently active"
+      echo "iptables -t mangle -F"
+      echo "tc qdisc del dev $INTERFACE root"
+      echo -n "execute commands to turn it off? (y/N) "
+      read correct
+      if [ "$correct" != "y" ] && [ "$correct" != "Y" ]; then
+          echo "$APPNAME: aborting..." >&2
+          exit
+      fi
+      echo ""
+    fi
+    verzweiflung_flush
+  fi
+  echo "$APPNAME: hack is inactive!"
+}
+
+verzweiflung_verify_gw_if()
+{
+  if [ "$(ip route show | grep $GATEWAY | grep $INTERFACE)" ]; then
+    echo "$APPNAME: verified network configuration."
+  else
+    echo -n "$APPNAME: failed to verify network configuration..."
+    if [ "$FORCE" ]; then
+      echo " forced continue"
+    else
+      echo " aborting."
+      exit
+    fi
+  fi
+}
+
+verzweiflung_apply()
+{
+  set -e
+  echo -n "$APPNAME: setting up iptables..."
+  iptables -t mangle -A OUTPUT -p tcp $SRC_PORT_OPT $DST_PORT_OPT -m mark ! --mark 0 -j RETURN
+  iptables -t mangle -A OUTPUT -p tcp $SRC_PORT_OPT $DST_PORT_OPT -j MARK --set-mark 1
+  iptables -t mangle -A OUTPUT -p tcp $SRC_PORT_OPT $DST_PORT_OPT -j CLASSIFY --set-class 1:2
+  for i in $(seq 3 $(($LEVEL + 1))); do
+    iptables -t mangle -A OUTPUT -p tcp $SRC_PORT_OPT $DST_PORT_OPT -j TEE --gateway $GATEWAY
+    iptables -t mangle -A OUTPUT -p tcp $SRC_PORT_OPT $DST_PORT_OPT -j CLASSIFY --set-class 1:$i
+  done
+  echo " success"
+
+  echo -n "$APPNAME: setting up traffic control..."
+  tc qdisc add dev "$INTERFACE" root handle 1: prio bands 5 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  tc qdisc add dev "$INTERFACE" parent 1:1 netem
+  tc qdisc add dev "$INTERFACE" parent 1:2 netem
+  tc qdisc add dev "$INTERFACE" parent 1:3 netem delay 50ms
+  tc qdisc add dev "$INTERFACE" parent 1:4 netem delay 100ms
+  tc qdisc add dev "$INTERFACE" parent 1:5 netem delay 150ms
+  echo " success"
+  echo "$APPNAME: hack is active!"
+}
+
+while getopts ":cd:fg:hi:l:ms:" opt; do
+  case $opt in
+    c)
+      CEASE=1
+      ;;
+    d)
+      DST_PORT="$OPTARG"
+      DST_PORT_OPT="--dport $OPTARG"
+      ;;
+    f)
+      FORCE=1
+      ;;
+    g)
+      GATEWAY="$OPTARG"
+      ;;
+    h)
+      verzweiflung_help
+      exit
+      ;;
+    i)
+      INTERFACE="$OPTARG"
+      ;;
+    l)
+      if [ "$OPTARG" -le 4 ] && [ "$OPTARG" -ge 2 ]; then
+        LEVEL="$OPTARG"
+      else
+        echo "$APPNAME: invalid argument for: -l" >&2
+        exit
+      fi
+      ;;
+    m)
+      STATS=1
+      ;;
+    s)
+      SRC_PORT="$OPTARG"
+      SRC_PORT_OPT="--sport $OPTARG"
+      ;;
+    \?)
+      echo "$APPNAME: invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+    :)
+      echo "$APPNAME: option -$OPTARG requires an argument." >&2
+      exit 1
+      ;;
+  esac
+done
+
+case "$OS_TYPE" in
+  "Linux" )
+  ;;
+  * )
+  echo -e "$APPNAME: only Linux is supported right now.\n"
+  exit
+esac
+
+if [ $(whoami) != root ]; then
+  echo -e "$APPNAME: need to be run as root user, aborting.\n"
+  exit
+fi
+
+if [ ! "$STATS" ] && [ ! "$CEASE" ]; then
+  echo -e "protocol: \t\tTCP/IP"
+  if [ "$SRC_PORT" ]; then
+    echo -e "source port(s): \t$SRC_PORT"
+  else
+    echo -e "source port(s): \tall"
+  fi
+  if [ "$DST_PORT" ]; then
+    echo -e "destination port(s): \t$DST_PORT"
+  else
+    echo -e "destination port(s): \tall"
+  fi
+  echo -e "retransmissions: \t$LEVEL\n"
+fi
+
+echo -e "$APPNAME: detecting network configuration..."
+if [ ! "$GATEWAY" ]; then
+  GATEWAY=$(ip route show | awk '/default/ { print $3 }' | head -n 1)
+fi
+if [ ! "$INTERFACE" ]; then
+  INTERFACE=$(ip route show | awk '/default/ { print $5 }' | head -n 1)
+fi
+echo -e "interface:\t\t$INTERFACE"
+echo -e "gateway:\t\t$GATEWAY"
+
+if [ ! "$FORCE" ]; then
+  echo -n "is the network configuration correct? (y/N) "
+  read correct
+  if [ "$correct" != "y" ] && [ "$correct" != "Y" ]; then
+    echo "$APPNAME: aborting..." >&2
+    exit
+  fi
+fi
+echo ""
+verzweiflung_verify_gw_if
+
+if [ "$STATS" ]; then
+  verzweiflung_stats
+  exit
+fi
+
+verzweiflung_cease
+if [ ! "$CEASE" ]; then
+  verzweiflung_apply
+fi
