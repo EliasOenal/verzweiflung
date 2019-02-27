@@ -16,7 +16,7 @@
 
 set -e
 APPNAME="$(basename $0)"
-VERSION="v0.1"
+VERSION="v0.2"
 LEVEL=3
 OS_TYPE=$(uname)
 SRC_PORT_OPT=""
@@ -59,7 +59,7 @@ verzweiflung_stats()
   verzweiflung_is_active && true
   if [ $? -eq 0 ]; then
     echo "$APPNAME: printing traffic control statistics"
-    tc -s qdisc ls dev "$INTERFACE" | tail -n12
+    tc -s qdisc ls dev "$INTERFACE" | tail -n15
   else
     echo "$APPNAME: hack is inactive!"
   fi
